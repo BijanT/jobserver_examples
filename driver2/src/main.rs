@@ -1,5 +1,6 @@
 use clap::{arg};
 use spurs::{cmd, Execute};
+use libscail::output::Parametrize;
 
 fn run_setup(remote_shell: &spurs::SshShell) -> Result<(), libscail::ScailError>
 {
@@ -13,6 +14,65 @@ fn run_setup(remote_shell: &spurs::SshShell) -> Result<(), libscail::ScailError>
     remote_shell.run(cmd!("sudo apt upgrade -y"))?;
     remote_shell.run(cmd!("sudo apt install -y {}", dependencies.join(" ")))?;
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Parametrize)]
+struct ExpConfig {
+    #[name]
+    exp: String,
+
+    time: u64,
+    iterations: u64,
+
+    #[timestamp]
+    timestamp: libscail::output::Timestamp,
+}
+
+fn run_experiment(remote_shell: &spurs::SshShell, sub_m: &clap::ArgMatches) -> Result<(), libscail::ScailError>
+{
+    // Create the ExpConfig struct. It derives the libscail::output::Parametrize
+    // trait, which is helpful for saving the parameters used in this experiment
+    // for future reference and generating unique output filenames.
+    let time = sub_m.get_one::<u64>("time").copied().unwrap();
+    let iterations = sub_m.get_one::<u64>("iterations").copied().unwrap();
+    let cfg = ExpConfig {
+        exp: "demo_experiment".to_string(),
+        time,
+        iterations,
+        timestamp: libscail::output::Timestamp::now(),
+    };
+
+    // Define the output files for this experiment
+    let home_dir = libscail::get_user_home_dir(remote_shell)?;
+    let results_dir = libscail::dir!(home_dir, "results/");
+    let params_file = libscail::dir!(&results_dir, cfg.gen_file_name("params"));
+    let time_file = libscail::dir!(&results_dir, cfg.gen_file_name("time"));
+
+    // Make sure the results directory exists
+    remote_shell.run(cmd!("mkdir -p {}", &results_dir))?;
+    // Save the parameters of this experiment in case we need them later
+    remote_shell.run(cmd!(
+        "echo {} | tee {}",
+        libscail::escape_for_bash(&serde_json::to_string(&cfg)?),
+        params_file
+    ))?;
+
+    // Run some dummy experiment and save the result
+    let start_time = std::time::Instant::now();
+    for _ in 0..iterations {
+        remote_shell.run(cmd!("sleep {}", time))?;
+    }
+    let elapsed_time = start_time.elapsed();
+    remote_shell.run(cmd!(
+        "echo {} | tee {}",
+        elapsed_time.as_secs_f64(),
+        time_file
+    ))?;
+
+    // The jobserver looks for the following in stdout of the driver program
+    // to know what files to copy from the experiment machine.
+    println!("RESULTS: {}", libscail::dir!(results_dir, cfg.gen_file_name("")));
     Ok(())
 }
 
@@ -33,6 +93,18 @@ fn run() -> Result<(), libscail::ScailError> {
             clap::Command::new("setup")
                 .about("Setup a fresh machine.")
         )
+        .subcommand(
+            clap::Command::new("experiment")
+                .about("Run the experiment")
+                .arg(
+                    arg!(--time <time> "The amount of time for each iteration")
+                        .value_parser(clap::value_parser!(u64)),
+                )
+                .arg(
+                    arg!(--iterations <iterations> "The number of iterations to run")
+                        .value_parser(clap::value_parser!(u64)),
+                )
+        )
         .subcommand_required(true)
         .get_matches();
 
@@ -46,6 +118,7 @@ fn run() -> Result<(), libscail::ScailError> {
 
     match matches.subcommand() {
         Some(("setup", _)) => run_setup(&remote_shell),
+        Some(("experiment", sub_m)) => run_experiment(&remote_shell, &sub_m),
         _ => unreachable!(),
     }
 }
